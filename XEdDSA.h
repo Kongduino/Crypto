@@ -30,26 +30,21 @@ void fe_invert(fe out, const fe z);
 
 void fe_tobytes(unsigned char *s, const fe h);
 
-// Optional replacements for the expensive steps of XEdDSA::sign(), for example on a
-// crypto accelerator. Either function may be null, and one that returns false makes
-// sign() do that step in software. The signature is byte-identical either way.
-struct XEdDSAHooks {
-    void *ctx; // passed to each function unchanged
-    // Encoded point scalar * B (B = Ed25519 base point); scalar is 32 bytes
-    // little-endian, already reduced mod q.
-    bool (*baseMul)(void *ctx, uint8_t point[32], const uint8_t scalar[32]);
-    // SHA-512 of the concatenation of count parts. Parts may be empty.
-    bool (*sha512)(void *ctx, uint8_t digest[64], const uint8_t *const parts[], const size_t lens[], size_t count);
-};
+// Computes the encoded point scalar * B (B = Ed25519 base point), for example on a
+// crypto accelerator. scalar is 32 bytes little-endian, already reduced mod q.
+// Returns false to make sign() fall back to its own software multiplication.
+typedef bool (*XEdDSABaseMulFn)(void *ctx, uint8_t point[32], const uint8_t scalar[32]);
 
 class XEdDSA : public Ed25519
 {
 public:
     static void priv_curve_to_ed_keys(uint8_t *curve_privkey, uint8_t *ed_privkey, uint8_t *ed_pubkey);
+    // baseMul, if given, computes R = r * B; the signature is byte-identical either way.
     static void sign(uint8_t signature[64], const uint8_t privateKey[32],
                    const uint8_t publicKey[32], const void *message, size_t len,
-                   const XEdDSAHooks *hooks = nullptr);
+                   XEdDSABaseMulFn baseMul = nullptr, void *baseMulCtx = nullptr);
 private:
-    static void sha512(const XEdDSAHooks *hooks, SHA512 *hash, uint8_t digest[64],
-                       const uint8_t *const parts[], const size_t lens[], size_t count);
+        static void deriveKeys(SHA512 *hash, limb_t *a, const uint8_t privateKey[32]);
+
+
 };
