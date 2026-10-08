@@ -899,26 +899,18 @@ void XEdDSA::priv_curve_to_ed_keys(uint8_t *curve_privkey, uint8_t *ed_privkey, 
 }
 
 /**
- * \brief Derive key material from a 32-byte private key.
- *
- * \param hash SHA512 hash object from the caller for use in this function.
- * The 64-byte output buffer within this hash object will contain the
- * hash prefix on exit.
- * \param a The secret scalar derived from \a privateKey.  This must be
- * NUM_LIMBS_256BIT limbs in size.
- * \param privateKey The 32-byte private key to derive all other values from.
+ * \brief SHA-512 of the concatenation of \a count parts, through
+ * \a hooks->sha512 if given and it succeeds, otherwise in software.
  */
-void XEdDSA::deriveKeys(SHA512 *hash, limb_t *a, const uint8_t privateKey[32])
+void XEdDSA::sha512(const XEdDSAHooks *hooks, SHA512 *hash, uint8_t digest[64],
+                    const uint8_t *const parts[], const size_t lens[], size_t count)
 {
-    uint8_t *buf = (uint8_t *)(hash->state.w); // Reuse hash buffer to save memory.
-
-    // Very important, we hash the private key to get a secret for the nonce hash
+    if (hooks && hooks->sha512 && hooks->sha512(hooks->ctx, digest, parts, lens, count))
+        return;
     hash->reset();
-    hash->update(privateKey, 32);
-    hash->finalize(buf, 0);
-
-    // Unpack the first half of the hash value into "a".
-    BigNumberUtil::unpackLE(a, NUM_LIMBS_256BIT, privateKey, 32);
+    for (size_t i = 0; i < count; i++)
+        hash->update(parts[i], lens[i]);
+    hash->finalize(digest, 64);
 }
 
 /**
@@ -930,42 +922,46 @@ void XEdDSA::deriveKeys(SHA512 *hash, limb_t *a, const uint8_t privateKey[32])
  * \param publicKey The public key corresponding to \a privateKey.
  * \param message Points to the message to be signed.
  * \param len The length of the \a message to be signed.
- * \param baseMul Optional function that computes R = r * B, for example on a crypto
- *  accelerator. If it is null or returns false, R is computed in software. The
- *  signature is the same either way.
- * \param baseMulCtx Passed to \a baseMul unchanged.
+ * \param hooks Optional functions that compute R = r * B and the SHA-512 hashes, for
+ *  example on a crypto accelerator. A null hook, or one that returns false, means
+ *  that step runs in software. The signature is the same either way.
  *
  * \sa verify(), derivePublicKey()
  */
 void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
                    const uint8_t publicKey[32], const void *message, size_t len,
-                   XEdDSABaseMulFn baseMul, void *baseMulCtx)
+                   const XEdDSAHooks *hooks)
 {
     SHA512 hash;
-    uint8_t *buf = (uint8_t *)(hash.state.w); // Reuse hash buffer to save memory.
+    const uint8_t *msg = (const uint8_t *)message;
+    uint8_t digest[64];
+    uint8_t prefix[32];
     limb_t a[NUM_LIMBS_256BIT];
     limb_t r[NUM_LIMBS_256BIT];
     limb_t k[NUM_LIMBS_256BIT];
     limb_t t[NUM_LIMBS_512BIT + 1];
     Point rB;
 
-    // Derive the secret scalar a and the message prefix from the private key.
-    deriveKeys(&hash, a, privateKey);
+    // The secret scalar a is the private key itself. Very important: we hash the
+    // private key to get a secret prefix for the nonce hash.
+    BigNumberUtil::unpackLE(a, NUM_LIMBS_256BIT, privateKey, 32);
+    const uint8_t *keyParts[] = {privateKey};
+    const size_t keyLens[] = {32};
+    sha512(hooks, &hash, digest, keyParts, keyLens, 1);
+    memcpy(prefix, digest + 32, 32);
 
-    // Hash the prefix and the message to derive r.
-    hash.reset();
-    hash.update(buf + 32, 32);
-    hash.update(message, len);
-    hash.update(signature, 32);
-    hash.finalize(buf, 0);
-    reduceQFromBuffer(r, buf, t);
+    // Hash the prefix, the message and the random Z (signature[0..31]) to derive r.
+    const uint8_t *rParts[] = {prefix, msg, signature};
+    const size_t rLens[] = {32, len, 32};
+    sha512(hooks, &hash, digest, rParts, rLens, 3);
+    reduceQFromBuffer(r, digest, t);
 
     // Encode rB into the first half of the signature buffer as R.
     bool haveR = false;
-    if (baseMul) {
+    if (hooks && hooks->baseMul) {
         uint8_t rBytes[32];
         BigNumberUtil::packLE(rBytes, 32, r, NUM_LIMBS_256BIT);
-        haveR = baseMul(baseMulCtx, signature, rBytes);
+        haveR = hooks->baseMul(hooks->ctx, signature, rBytes);
         clean(rBytes);
     }
     if (!haveR) {
@@ -974,12 +970,10 @@ void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
     }
 
     // Hash R, A, and the message to get k.
-    hash.reset();
-    hash.update(signature, 32); // R
-    hash.update(publicKey, 32); // A
-    hash.update(message, len);
-    hash.finalize(buf, 0);
-    reduceQFromBuffer(k, buf, t);
+    const uint8_t *kParts[] = {signature, publicKey, msg};
+    const size_t kLens[] = {32, 32, len};
+    sha512(hooks, &hash, digest, kParts, kLens, 3);
+    reduceQFromBuffer(k, digest, t);
 
     // Compute s = (r + k * a) mod q.
     Curve25519::mulNoReduce(t, k, a);
@@ -990,6 +984,8 @@ void XEdDSA::sign(uint8_t signature[64], const uint8_t privateKey[32],
     BigNumberUtil::packLE(signature + 32, 32, t, NUM_LIMBS_256BIT);
 
     // Clean up.
+    clean(digest);
+    clean(prefix);
     clean(a);
     clean(r);
     clean(k);
